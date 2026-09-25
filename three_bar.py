@@ -1,0 +1,422 @@
+/*
+NOMAD 4 - Three-bar truss with a custom tangent USER_POLL.
+
+This file is adapted to the callback signature supplied in NOMAD 4's
+CustomPollMethod example:
+
+bool callback(const NOMAD::Step&,
+std::list<NOMAD::Direction>&,
+const size_t n)
+
+The standard QR basis is retained, but each +q and -q direction is
+projected separately onto the linearized tangent cone at the current
+frame center. Bound-tangent conditions are also enforced.
+/
+#include "Nomad/nomad.hpp"
+#include "Algos/EvcInterface.hpp"
+#include "Algos/Mads/Mads.hpp"
+#include "Algos/Mads/MadsMegaIteration.hpp"
+#include "Algos/Mads/PollMethodBase.hpp"
+#include "Algos/Mads/SearchMethodAlgo.hpp"
+#include "Algos/SubproblemManager.hpp"
+#include "Cache/CacheBase.hpp"
+#include "Type/EvalSortType.hpp"
+#include "Algos/AlgoStopReasons.hpp"
+#include "Util/AllStopReasons.hpp"
+#include "Math/MatrixUtils.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <iostream>
+#include <list>
+#include <memory>
+#include <string>
+#include <vector>
+namespace
+{
+constexpr std::size_t N = 2;
+constexpr double SQRT2 = 1.4142135623730950488;
+constexpr double LENGTH = 100.0;
+constexpr double LOAD = 2.0;
+constexpr double ALLOWABLE_STRESS = 2.0;
+constexpr double LOWER_BOUND = 1.0e-6;
+constexpr double UPPER_BOUND = 1.0;
+constexpr double ACTIVE_TOL = 1.0e-6;
+constexpr double ZERO_TOL = 1.0e-12;
+constexpr std::size_t MAX_PROJECTION_SWEEPS = 25;
+using Vec = std::array<double, N>;
+struct ConstraintData
+{
+std::array<double, 3> values{};
+std::array<Vec, 3> gradients{};
+};
+inline double dot(const Vec& a, const Vec& b)
+{
+double value = 0.0;
+for (std::size_t i = 0; i < N; ++i)
+{
+value += a[i] * b[i];
+}
+return value;
+}
+inline double normSquared(const Vec& x)
+{
+return dot(x, x);
+}
+inline bool normalize(Vec& x)
+{
+const double n2 = normSquared(x);
+if (!(n2 > ZERO_TOL * ZERO_TOL) || !std::isfinite(n2))
+{
+return false;
+}
+const double inverseNorm = 1.0 / std::sqrt(n2);
+for (double& value : x)
+{
+value = inverseNorm;
+}
+return true;
+}
+ConstraintData evaluateConstraintsAndGradients(const Vec& x)
+{
+const double a1 = x[0];
+const double a2 = x[1];
+const double denominator = SQRT2 * a1 * a1 + 2.0 * a1 * a2;
+const double denominatorSquared = denominator * denominator;
+const double numerator1 = SQRT2 * a1 + a2;
+const double denominator3 = SQRT2 * a2 + a1;
+if (a1 <= 0.0 || a2 <= 0.0 || denominator <= 0.0 || denominator3 <= 0.0)
+{
+throw NOMAD::Exception(
+__FILE__, __LINE__,
+"Invalid point while evaluating three-bar truss constraints."
+);
+}
+const double dD_da1 = 2.0 * SQRT2 * a1 + 2.0 * a2;
+const double dD_da2 = 2.0 * a1;
+ConstraintData data;
+data.values[0] = LOAD * numerator1 / denominator - ALLOWABLE_STRESS;
+data.values[1] = LOAD * a2 / denominator - ALLOWABLE_STRESS;
+data.values[2] = LOAD / denominator3 - ALLOWABLE_STRESS;
+data.gradients[0][0] =
+LOAD * (SQRT2 * denominator - numerator1 * dD_da1)
+/ denominatorSquared;
+data.gradients[0][1] =
+LOAD * (denominator - numerator1 * dD_da2)
+/ denominatorSquared;
+data.gradients[1][0] =
+-LOAD * a2 * dD_da1 / denominatorSquared;
+data.gradients[1][1] =
+LOAD * (denominator - a2 * dD_da2)
+/ denominatorSquared;
+data.gradients[2][0] = -LOAD / (denominator3 * denominator3);
+data.gradients[2][1] = -LOAD * SQRT2 / (denominator3 * denominator3);
+return data;
+}
+Vec projectOntoHalfspace(const Vec& direction, const Vec& normal)
+{
+Vec projected = direction;
+const double normalNormSquared = normSquared(normal);
+if (normalNormSquared <= ZERO_TOL * ZERO_TOL)
+{
+return projected;
+}
+const double violation = dot(normal, projected);
+if (violation > 0.0)
+{
+const double multiplier = violation / normalNormSquared;
+for (std::size_t j = 0; j < N; ++j)
+{
+projected[j] -= multiplier * normal[j];
+}
+}
+return projected;
+}
+void enforceBoundTangentConditions(Vec& direction, const Vec& x)
+{
+for (std::size_t j = 0; j < N; ++j)
+{
+if (x[j] <= LOWER_BOUND + ACTIVE_TOL && direction[j] < 0.0)
+{
+direction[j] = 0.0;
+}
+if (x[j] >= UPPER_BOUND - ACTIVE_TOL && direction[j] > 0.0)
+{
+direction[j] = 0.0;
+}
+}
+}
+Vec projectOntoLinearizedTangentCone(const Vec& direction, const Vec& x)
+{
+const ConstraintData data = evaluateConstraintsAndGradients(x);
+std::vector<Vec> activeNormals;
+for (std::size_t i = 0; i < data.values.size(); ++i)
+{
+// For g_i(x) <= 0, treat g_i(x) >= -ACTIVE_TOL as active.
+if (data.values[i] >= -ACTIVE_TOL)
+{
+activeNormals.push_back(data.gradients[i]);
+}
+}
+Vec projected = direction;
+// Alternating projections onto the tangent halfspaces. In dimension two
+// this is inexpensive. Replace by a small QP if exact Euclidean projection
+// onto the intersection is required for many active constraints.
+for (std::size_t sweep = 0; sweep < MAX_PROJECTION_SWEEPS; ++sweep)
+{
+const Vec previous = projected;
+for (const Vec& normal : activeNormals)
+{
+projected = projectOntoHalfspace(projected, normal);
+}
+enforceBoundTangentConditions(projected, x);
+Vec change{};
+for (std::size_t j = 0; j < N; ++j)
+{
+change[j] = projected[j] - previous[j];
+}
+if (normSquared(change) <= ZERO_TOL * ZERO_TOL)
+{
+break;
+}
+}
+return projected;
+}
+NOMAD::Direction toNomadDirection(const Vec& x)
+{
+NOMAD::Direction direction(N, 0.0);
+for (std::size_t j = 0; j < N; ++j)
+{
+direction[j] = x[j];
+}
+return direction;
+}
+Vec frameCenterToVec(const NOMAD::EvalPoint& point)
+{
+Vec x{};
+for (std::size_t j = 0; j < N; ++j)
+{
+x[j] = point[j].todouble();
+}
+return x;
+}
+void deleteMatrix(double** matrix, std::size_t rows)
+{
+if (matrix == nullptr)
+{
+return;
+}
+for (std::size_t i = 0; i < rows; ++i)
+{
+delete[] matrix[i];
+}
+delete[] matrix;
+}
+class TrussEvaluator final : public NOMAD::Evaluator
+{
+public:
+explicit TrussEvaluator(
+const std::shared_ptr<NOMAD::EvalParameters>& evalParameters
+)
+: NOMAD::Evaluator(evalParameters, NOMAD::EvalType::BB)
+{
+}
+~TrussEvaluator() override = default;
+bool eval_x(
+NOMAD::EvalPoint& x,
+const NOMAD::Double& hMax,
+bool& countEval
+) const override
+{
+(void)hMax;
+const Vec point{x[0].todouble(), x[1].todouble()};
+const ConstraintData constraintData = evaluateConstraintsAndGradients(point);
+const double objective =
+LENGTH * (2.0 * SQRT2 * point[0] + point[1]);
+NOMAD::Double f(objective);
+NOMAD::Double g1(constraintData.values[0]);
+NOMAD::Double g2(constraintData.values[1]);
+NOMAD::Double g3(constraintData.values[2]);
+// BB_OUTPUT_TYPE is OBJ PB PB PB, in the same order.
+x.setBBO(
+f.tostring() + " "
+g1.tostring() + " "
+g2.tostring() + " "
+g3.tostring()
+);
+countEval = true;
+return true;
+}
+};
+void initializeParameters(
+const std::shared_ptr<NOMAD::AllParameters>& allParameters
+)
+{
+allParameters->setAttributeValue("DIMENSION", N);
+allParameters->setAttributeValue("MAX_BB_EVAL", 1000);
+NOMAD::Point x0(N);
+x0[0] = 1.0;
+x0[1] = 1.0;
+allParameters->setAttributeValue("X0", x0);
+allParameters->setAttributeValue(
+"LOWER_BOUND",
+NOMAD::ArrayOfDouble(N, LOWER_BOUND)
+);
+allParameters->setAttributeValue(
+"UPPER_BOUND",
+NOMAD::ArrayOfDouble(N, UPPER_BOUND)
+);
+NOMAD::BBOutputTypeList outputTypes;
+outputTypes.emplace_back(NOMAD::BBOutputType::OBJ);
+outputTypes.emplace_back(NOMAD::BBOutputType::PB);
+outputTypes.emplace_back(NOMAD::BBOutputType::PB);
+outputTypes.emplace_back(NOMAD::BBOutputType::PB);
+allParameters->setAttributeValue("BB_OUTPUT_TYPE", outputTypes);
+// USER_POLL only: this replaces, rather than augments, ORTHO_2N.
+NOMAD::DirectionTypeList directionTypes = {
+NOMAD::DirectionType::USER_POLL
+};
+allParameters->setAttributeValue("DIRECTION_TYPE", directionTypes);
+// User callbacks are not used in quadratic-model search by default.
+// Disable these searches for a clean experiment of the custom poll.
+allParameters->setAttributeValue("QUAD_MODEL_SEARCH", false);
+allParameters->setAttributeValue("NM_SEARCH", false);
+allParameters->setAttributeValue("DISPLAY_DEGREE", 3);
+allParameters->setAttributeValue(
+"DISPLAY_STATS",
+NOMAD::ArrayOfString("bbe ( sol ) obj h")
+);
+allParameters->checkAndComply();
+}
+bool tangentPollCallback(
+const NOMAD::Step& step,
+std::list<NOMAD::Direction>& directions,
+const std::size_t dimension
+)
+{
+const auto* mads =
+dynamic_cast<const NOMAD::Mads>(step.getRootAlgorithm());
+if (mads == nullptr)
+{
+throw NOMAD::Exception(__FILE__, __LINE__, "No Mads available.");
+}
+const auto* callingPoll =
+dynamic_cast<const NOMAD::PollMethodBase>(&step);
+if (callingPoll == nullptr)
+{
+throw NOMAD::Exception(__FILE__, __LINE__, "No poll method available.");
+}
+const auto frameCenter = callingPoll->getFrameCenter();
+if (frameCenter == nullptr)
+{
+throw NOMAD::Exception(__FILE__, __LINE__, "No frame center available.");
+}
+const auto problemParameters = mads->getPbParams();
+const std::size_t problemDimension =
+problemParameters->getAttributeValue<std::size_t>("DIMENSION");
+if (dimension != N || problemDimension != N)
+{
+throw NOMAD::Exception(
+__FILE__, __LINE__,
+"This example requires DIMENSION 2."
+);
+}
+if (step.getIterationMesh() == nullptr)
+{
+throw NOMAD::Exception(__FILE__, __LINE__, "No mesh available.");
+}
+const Vec x = frameCenterToVec(frameCenter);
+directions.clear();
+// Keep the original NOMAD QR construction to obtain an orthonormal basis.
+NOMAD::Direction randomUnitDirection(dimension, 0.0);
+NOMAD::Direction::computeDirOnUnitSphere(randomUnitDirection);
+while (randomUnitDirection[0] == 0)
+{
+NOMAD::Direction::computeDirOnUnitSphere(randomUnitDirection);
+}
+double** M = new double[dimension];
+double** Q = new double[dimension];
+double** R = new double[dimension];
+for (std::size_t i = 0; i < dimension; ++i)
+{
+M[i] = new double[dimension];
+Q[i] = new double[dimension];
+R[i] = new double[dimension];
+M[i][0] = randomUnitDirection[i].todouble();
+for (std::size_t j = 1; j < dimension; ++j)
+{
+M[i][j] = (i == j) ? 1.0 : 0.0;
+}
+}
+std::string errorMessage;
+const bool qrSuccess = NOMAD::qr_factorization(
+errorMessage,
+M,
+Q,
+R,
+static_cast<int>(dimension),
+static_cast<int>(dimension)
+);
+if (!qrSuccess || !errorMessage.empty())
+{
+deleteMatrix(M, dimension);
+deleteMatrix(Q, dimension);
+deleteMatrix(R, dimension);
+std::cerr << "QR decomposition failed: " << errorMessage << std::endl;
+return false;
+}
+for (std::size_t column = 0; column < dimension; ++column)
+{
+Vec q{};
+Vec minusQ{};
+for (std::size_t row = 0; row < dimension; ++row)
+{
+q[row] = Q[row][column];
+minusQ[row] = -Q[row][column];
+}
+// Important: project +q and -q separately. The negative of a feasible
+// tangent direction need not belong to a one-sided tangent cone.
+Vec tangentPositive = projectOntoLinearizedTangentCone(q, x);
+Vec tangentNegative = projectOntoLinearizedTangentCone(minusQ, x);
+if (normalize(tangentPositive))
+{
+directions.push_back(toNomadDirection(tangentPositive));
+}
+if (normalize(tangentNegative))
+{
+directions.push_back(toNomadDirection(tangentNegative));
+}
+}
+deleteMatrix(M, dimension);
+deleteMatrix(Q, dimension);
+deleteMatrix(R, dimension);
+if (directions.empty())
+{
+std::cerr << "No nonzero tangent poll direction was generated."
+<< std::endl;
+return false;
+}
+std::cout << "USER_POLL at x = " << frameCenter->display()
+<< ": generated " << directions.size()
+<< " tangent directions." << std::endl;
+return true;
+}
+} // namespace
+int main()
+{
+NOMAD::MainStep mainStep;
+auto parameters = std::make_shared<NOMAD::AllParameters>();
+initializeParameters(parameters);
+mainStep.setAllParameters(parameters);
+std::unique_ptr<TrussEvaluator> evaluator(
+new TrussEvaluator(parameters->getEvalParams())
+);
+mainStep.setEvaluator(std::move(evaluator));
+mainStep.addCallback<NOMAD::MadsCallbackType::USER_METHOD_POLL>(
+tangentPollCallback
+);
+mainStep.start();
+mainStep.run();
+mainStep.end();
+return 0;
+}
