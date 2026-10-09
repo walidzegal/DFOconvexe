@@ -1,1 +1,10 @@
-L’algorithme proposé constitue une extension expérimentale de l’approche FSP présentée dans [référence]. Il reprend le principe de recherche dans des directions adaptées aux contraintes, tout en l’intégrant au mécanisme de poll de NOMAD et en introduisant une construction basée sur le cône tangent.
+cd /gpfs/home/cx2484/convexe
+module load gcc/13.4.0
+module load cmake/4.4.0
+
+# 1. Localiser l'exécutable
+find build -name "projectedPollMethod.exe"
+
+# 2. Se placer dans son dossier et le lancer
+cd <dossier_trouvé_par_find>
+./projectedPollMethod.exe
