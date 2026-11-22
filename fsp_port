@@ -1,0 +1,31 @@
+Je commence par lire le dépôt FSP pour comprendre l'algorithme avant de l'implémenter en Python et en C++.
+
+Le dépôt contient déjà une implémentation Python (algorithms, problems, utils). Je lis le code pour le reproduire fidèlement.
+
+Je clone le dépôt, j'ai lu l'algorithme et les problèmes de test. J'écris maintenant la version Python puis la version C++.
+
+Python fonctionne et les optima sont corrects : HS22 donne (√5−1)² = 1,5279 et HS29 donne 1/(3√3) = 0,19245. Je passe au C++.
+
+J'ai écrit FSP en Python (numpy seulement) et en C++17 (header-only), avec les 23 problèmes tests du dépôt et un benchmark pour chaque langage. Les deux versions donnent les mêmes valeurs optimales sur les 23 problèmes, dans les modes `Standard` et `Parallel`. Elles ont été lancées dans les deux langages. Par exemple, HS22 atteint (√5−1)² ≈ 1,5279 et HS29 atteint 1/(3√3) ≈ 0,19245.
+
+Le dépôt de Mansueto contenait déjà une version Python (`algorithms/fsp.py`, avec cvxopt et pandas). Je l'ai donc réécrite sans ces dépendances, avec une API plus simple, puis portée en C++.
+
+**Écarts entre les versions**
+- **Nombre d'itérations :** il diffère de quelques unités sur 2 problèmes seulement (HS22 avec c=5, et HS43 en mode Parallel). C'est dû à l'ordre des sommes flottantes entre numpy et C++, pas à une erreur de logique.
+- **Projection sur l'ellipsoïde :** pour `HS29_Original`, je la calcule exactement avec l'équation séculaire au lieu du solveur cvxopt du dépôt. Les résultats concordent.
+- **Non repris :** le tableau LaTeX et la sérialisation pickle du `main.py` d'origine.
+
+Le code dérive d'un dépôt GPL-3.0, donc il doit rester sous GPL-3.0 et citer l'article (Jia, Lapucci, Mansueto, OMS 2026). Le README du zip détaille l'algorithme et l'utilisation.
+
+Fichiers (dans `fsp_port.zip`) :
+- `python/fsp.py`
+- `python/problems.py`
+- `python/main.py`
+- `cpp/fsp.hpp`
+- `cpp/problems.hpp`
+- `cpp/main.cpp`
+- `cpp/Makefile`
+- `cpp/CMakeLists.txt`
+- `README.md`
+
+Sources : [pierlumanzu/FSP](https://github.com/pierlumanzu/FSP)
